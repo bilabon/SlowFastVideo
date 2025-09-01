@@ -1,35 +1,108 @@
 # python3.10 -m venv venv && source venv/bin/activate && pip freeze && python3.10 -V && pip --no-cache-dir install -U pip && pip --no-cache-dir install -U setuptools && pip --no-cache-dir install -U wheel
-# pip install pyinstaller
-# pip install PyQt5
-# cp $(which ffmpeg) ./ffmpeg
-# cp $(which ffprobe) ./ffprobe
-# arch -arm64 pyinstaller --windowed --name "SlowFastVideo" --add-binary "ffmpeg:./" --icon=SlowFastVideo.icns SlowFastVideo.py
-# pyinstaller --windowed --onefile --name "SlowFastVideo" --add-binary "ffmpeg:./" --icon=slowfastvideo.icns  SlowFastVideo.py
+# python3 -m venv venv
+# source venv/bin/activate
+# python -m pip install -U pip wheel setuptools
+# python -m pip install pyinstaller PyQt5
+# # Download latest snapshot static ARM64 builds
+# curl -L -o ffmpeg.zip  https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffmpeg.zip
+# curl -L -o ffprobe.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffprobe.zip
 
+# # Unzip just the binaries into the project root
+# unzip -j ffmpeg.zip  -d .
+# unzip -j ffprobe.zip -d .
+
+# # Make them runnable & remove quarantine
+# chmod +x ffmpeg ffprobe
+# xattr -dr com.apple.quarantine ffmpeg ffprobe
+
+# # Quick check — these should print versions without “Library not loaded” errors
+# ./ffmpeg -version
+# ./ffprobe -version
+
+# # (Optional) sanity check for external deps — should NOT show /opt/homebrew/...
+# otool -L ffmpeg
+# otool -L ffprobe
+
+## Build the .app
+# pyinstaller SlowFastVideo.spec
 
 import sys
 import os
-import subprocess
 import re
 import json
-from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout,
-                             QPushButton, QHBoxLayout, QSlider, QFileDialog)
+import shutil
+import stat
+import subprocess
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout,
+    QPushButton, QHBoxLayout, QSlider, QFileDialog
+)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
+APP_NAME = "SlowFastVideo"
+
+
+# ---------- PATH HELPERS ----------
+def is_windows():
+    return os.name == "nt"
+
+def resource_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def tool_path(name):
+    if is_windows() and not name.lower().endswith(".exe"):
+        name += ".exe"
+    candidate = os.path.join(resource_dir(), name)
+    if os.path.exists(candidate):
+        try:
+            st = os.stat(candidate)
+            os.chmod(candidate, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except Exception:
+            pass
+        return candidate
+    found = shutil.which(name)
+    return found or name
 
 def get_ffmpeg_path():
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, "ffmpeg")
-    return "ffmpeg"
+    return tool_path("ffmpeg")
 
+def get_ffprobe_path():
+    return tool_path("ffprobe")
 
 def get_settings_path():
-    home_dir = os.path.expanduser("~")
-    path = os.path.join(home_dir, "Library", "Application Support", "SlowFastVideo")
-    os.makedirs(path, exist_ok=True)
-    return os.path.join(path, "settings.json")
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support", APP_NAME)
+    elif is_windows():
+        base = os.path.join(os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")), APP_NAME)
+    else:
+        base = os.path.join(home, ".config", APP_NAME)
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "settings.json")
 
 
+# ---------- ATEMPO CHAIN ----------
+def atempo_chain(speed: float) -> str:
+    if speed <= 0:
+        return "atempo=1.0"
+    parts = []
+    remain = speed
+    if remain >= 1.0:
+        while remain > 2.0 + 1e-6:
+            parts.append("atempo=2.0")
+            remain /= 2.0
+        parts.append(f"atempo={remain:.2f}")
+    else:
+        while remain < 0.5 - 1e-6:
+            parts.append("atempo=0.5")
+            remain *= 2.0
+        parts.append(f"atempo={remain:.2f}")
+    return ",".join(parts)
+
+
+# ---------- WORKER ----------
 class ConversionWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal()
@@ -46,7 +119,10 @@ class ConversionWorker(QThread):
     def run(self):
         try:
             self.process = subprocess.Popen(
-                self.command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True
+                self.command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
             )
 
             for line in self.process.stdout:
@@ -55,22 +131,20 @@ class ConversionWorker(QThread):
                     self.process.wait()
                     self.canceled.emit()
                     return
-
                 line = line.strip()
                 if line.startswith("out_time="):
-                    timestr = line.split('=', 1)[1].strip()
-                    current_time = self.parse_time(timestr)
-                    if current_time is not None and self.total_duration > 0:
-                        progress = int((current_time / self.total_duration) * 100)
-                        self.progress.emit(min(progress, 100))
+                    t = self.parse_time(line.split("=", 1)[1])
+                    if t is not None and self.total_duration > 0:
+                        progress = int((t / self.total_duration) * 100)
+                        self.progress.emit(min(max(progress, 0), 100))
 
             self.process.wait()
-
             if self._canceled:
                 self.canceled.emit()
             else:
                 if self.process.returncode != 0:
-                    self.error.emit("FFmpeg process failed")
+                    err = self.process.stderr.read() if self.process.stderr else ""
+                    self.error.emit(f"FFmpeg failed: {err[:400]}")
                 else:
                     self.finished.emit()
 
@@ -86,20 +160,18 @@ class ConversionWorker(QThread):
     @staticmethod
     def parse_time(timestr):
         try:
-            h, m, s = timestr.split(':')
-            s = float(s)
-            return float(h)*3600 + float(m)*60 + s
-        except:
+            h, m, s = timestr.split(":")
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
             return None
 
 
+# ---------- GUI ----------
 class SlowFastVideo(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SlowFastVideo")
-        self.setFixedSize(400, 300)
-
-        # Включаем поддержку Drag & Drop
+        self.setWindowTitle(APP_NAME)
+        self.setFixedSize(430, 320)
         self.setAcceptDrops(True)
 
         self.settings_file = get_settings_path()
@@ -117,12 +189,13 @@ class SlowFastVideo(QWidget):
 
         slider_layout = QHBoxLayout()
         self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(50, 300)
+        self.speed_slider.setRange(25, 400)   # 0.25x – 4.00x
+        self.speed_slider.setSingleStep(10)   # шаг 0.1x
         self.speed_slider.setValue(self.speed_value)
         self.speed_slider.valueChanged.connect(self.update_speed_label)
 
         self.speed_value_label = QLabel(f"{self.speed_slider.value() / 100:.1f}x")
-        slider_layout.addWidget(QLabel("0.5x"))
+        slider_layout.addWidget(QLabel("0.25x"))
         slider_layout.addWidget(self.speed_slider)
         slider_layout.addWidget(self.speed_value_label)
         layout.addLayout(slider_layout)
@@ -136,125 +209,18 @@ class SlowFastVideo(QWidget):
         self.is_converting = False
         self.worker = None
 
+        os.environ["PATH"] = resource_dir() + os.pathsep + os.environ.get("PATH", "")
+
+    # ---- UI helpers ----
     def elide_text(self, text, widget, mode=Qt.ElideMiddle):
         fm = widget.fontMetrics()
-        max_width = widget.width() - 10
-        return fm.elidedText(text, mode, max_width)
-
-    def load_settings(self):
-        if os.path.exists(self.settings_file):
-            try:
-                with open(self.settings_file, "r") as f:
-                    settings = json.load(f)
-                    self.last_folder = settings.get("last_folder", None)
-                    self.speed_value = settings.get("last_speed", 100)
-            except:
-                pass
-
-    def save_settings(self):
-        settings = {"last_folder": self.last_folder, "last_speed": self.speed_slider.value()}
-        try:
-            with open(self.settings_file, "w") as f:
-                json.dump(settings, f)
-        except:
-            pass
-
-    def select_file(self, event):
-        if not self.drop_label.isEnabled():
-            return
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", self.last_folder or "", "Video Files (*.mp4 *.mov *.avi *.mkv *.flv *.webm)"
-        )
-        if file_path:
-            self.set_input_file(file_path)
-
-    def set_input_file(self, file_path):
-        self.input_file = file_path
-        self.last_folder = os.path.dirname(file_path)
-        base_name = os.path.basename(file_path)
-        elided_text = self.elide_text(f"{base_name}", self.drop_label)
-        self.drop_label.setText(elided_text)
-        title_text = f"SlowFastVideo - {base_name}"
-        elided_title = self.elide_text(title_text, self)
-        self.setWindowTitle(elided_title)
+        return fm.elidedText(text, mode, widget.width() - 10)
 
     def update_speed_label(self):
         self.speed_value_label.setText(f"{self.speed_slider.value() / 100:.1f}x")
 
-    def convert_or_cancel(self):
-        if not self.is_converting:
-            self.start_conversion()
-        else:
-            self.cancel_conversion()
-
-    def start_conversion(self):
-        if not self.input_file:
-            self.drop_label.setText("Please select a file first!")
-            return
-
-        total_duration = self.get_video_duration(self.input_file)
-        if total_duration is None:
-            self.drop_label.setText("Error reading video duration!")
-            return
-
-        speed_factor = self.speed_slider.value() / 100.0
-        output_duration = total_duration / speed_factor
-
-        output_file = self.generate_output_filename(self.input_file)
-
-        setpts_value = 1.0 / speed_factor
-        atempo_value = speed_factor
-
-        command = [
-            get_ffmpeg_path(), "-i", self.input_file,
-            "-filter:v", f"setpts={setpts_value}*PTS", "-filter:a", f"atempo={atempo_value}",
-            "-progress", "pipe:1", "-y", output_file
-        ]
-
-        self.drop_label.setEnabled(False)
-        self.convert_button.setEnabled(True)
-        self.convert_button.setText("Cancel")
-        self.drop_label.setText("0%")
-        self.is_converting = True
-
-        self.worker = ConversionWorker(command, output_duration)
-        self.worker.progress.connect(self.update_progress_area)
-        self.worker.finished.connect(self.conversion_finished)
-        self.worker.error.connect(self.conversion_error)
-        self.worker.canceled.connect(self.conversion_canceled)
-        self.worker.start()
-
-    def cancel_conversion(self):
-        if self.worker is not None and self.is_converting:
-            self.worker.cancel()
-
-    def get_video_duration(self, file_path):
-        cmd = [get_ffmpeg_path(), "-i", file_path]
-        try:
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True)
-            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", result.stderr)
-            if match:
-                h, m, s = match.groups()
-                return float(h)*3600 + float(m)*60 + float(s)
-        except:
-            pass
-        return None
-
-    def generate_output_filename(self, input_file):
-        base, ext = os.path.splitext(input_file)
-        output_file = f"{base}-ffmpeg-1{ext}"
-        i = 1
-        while os.path.exists(output_file):
-            output_file = f"{base}-ffmpeg-{i}{ext}"
-            i += 1
-        return output_file
-
-    def update_progress_area(self, value):
-        self.drop_label.setText(f"{value}%")
-        self.drop_label.setStyleSheet(self.get_progress_style(value))
-
     def get_progress_style(self, progress):
-        green_part = progress / 100.0
+        green = progress / 100.0
         return f"""
             QLabel {{
                 border: 2px dashed #aaa;
@@ -263,8 +229,8 @@ class SlowFastVideo(QWidget):
                 background: qlineargradient(
                     x1:0, y1:0, x2:1, y2:0,
                     stop:0 #007BFF,
-                    stop:{green_part:.2f} #007BFF,
-                    stop:{green_part:.2f} white,
+                    stop:{green:.2f} #007BFF,
+                    stop:{green:.2f} white,
                     stop:1 white
                 );
                 padding: 10px;
@@ -276,16 +242,122 @@ class SlowFastVideo(QWidget):
         self.convert_button.setEnabled(True)
         self.convert_button.setText("Convert")
         self.input_file = None
-        self.setWindowTitle("SlowFastVideo")
         self.is_converting = False
+        self.setWindowTitle(APP_NAME)
+
+    # ---- Settings ----
+    def load_settings(self):
+        if os.path.exists(self.settings_file):
+            try:
+                with open(self.settings_file, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                    self.last_folder = s.get("last_folder")
+                    self.speed_value = int(s.get("last_speed", 100))
+            except Exception:
+                pass
+
+    def save_settings(self):
+        s = {"last_folder": self.last_folder, "last_speed": self.speed_slider.value()}
+        try:
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump(s, f)
+        except Exception:
+            pass
+
+    # ---- File selection / DnD ----
+    def select_file(self, event):
+        if not self.drop_label.isEnabled():
+            return
+        fpath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            self.last_folder or "",
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.flv *.webm *.m4v *.mpg *.mpeg)"
+        )
+        if fpath:
+            self.set_input_file(fpath)
+
+    def set_input_file(self, path):
+        self.input_file = path
+        self.last_folder = os.path.dirname(path)
+        base = os.path.basename(path)
+        self.drop_label.setText(self.elide_text(base, self.drop_label))
+        self.setWindowTitle(self.elide_text(f"{APP_NAME} - {base}", self))
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if os.path.isfile(path):
+                self.set_input_file(path)
+        event.acceptProposedAction()
+
+    # ---- Conversion ----
+    def convert_or_cancel(self):
+        if not self.is_converting:
+            self.start_conversion()
+        else:
+            self.cancel_conversion()
+
+    def cancel_conversion(self):
+        if self.worker and self.is_converting:
+            self.worker.cancel()
+
+    def start_conversion(self):
+        if not self.input_file:
+            self.drop_label.setText("Please select a file first!")
+            return
+
+        total = self.get_video_duration(self.input_file)
+        if total is None:
+            self.drop_label.setText("Error reading video duration!")
+            return
+
+        speed = self.speed_slider.value() / 100.0
+        output_duration = total / speed
+        output_file = self.generate_output_filename(self.input_file)
+
+        setpts = f"{1.0 / speed:.6f}*PTS"
+        atempo = atempo_chain(speed)
+
+        cmd = [
+            get_ffmpeg_path(),
+            "-hide_banner", "-v", "error",
+            "-i", self.input_file,
+            "-filter:v", f"setpts={setpts}",
+            "-filter:a", atempo,
+            "-progress", "pipe:1",
+            "-y", output_file
+        ]
+
+        self.drop_label.setEnabled(False)
+        self.convert_button.setText("Cancel")
+        self.drop_label.setText("0%")
+        self.is_converting = True
+
+        self.worker = ConversionWorker(cmd, output_duration)
+        self.worker.progress.connect(self.update_progress_area)
+        self.worker.finished.connect(self.conversion_finished)
+        self.worker.error.connect(self.conversion_error)
+        self.worker.canceled.connect(self.conversion_canceled)
+        self.worker.start()
+
+    def update_progress_area(self, val):
+        self.drop_label.setText(f"{val}%")
+        self.drop_label.setStyleSheet(self.get_progress_style(val))
 
     def conversion_finished(self):
         self.drop_label.setText("Conversion completed!")
         self.reset_ui()
         self.save_settings()
 
-    def conversion_error(self, error_message):
-        self.drop_label.setText(f"Error: {error_message}")
+    def conversion_error(self, msg):
+        self.drop_label.setText(f"Error: {msg[:300]}")
         self.reset_ui()
         self.save_settings()
 
@@ -294,24 +366,40 @@ class SlowFastVideo(QWidget):
         self.reset_ui()
         self.save_settings()
 
-    # Реализация Drag & Drop:
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+    # ---- Helpers ----
+    def get_video_duration(self, path):
+        cmd = [
+            get_ffprobe_path(),
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            if res.returncode == 0:
+                txt = res.stdout.strip()
+                if txt:
+                    return float(txt)
+            if res.stderr:
+                self.drop_label.setText(f"ffprobe error: {res.stderr[:200]}")
+        except Exception as e:
+            self.drop_label.setText(f"ffprobe exc: {e}")
+        return None
 
-    def dropEvent(self, event):
-        # Обрабатываем все файлы, перетащенные в окно
-        for url in event.mimeData().urls():
-            file_path = url.toLocalFile()
-            if os.path.isfile(file_path):
-                self.set_input_file(file_path)
-        event.acceptProposedAction()
+    def generate_output_filename(self, path):
+        base, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            out = f"{base}-converted-{i}{ext}"
+            if not os.path.exists(out):
+                return out
+            i += 1
 
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = SlowFastVideo()
-    window.show()
+    win = SlowFastVideo()
+    win.show()
     sys.exit(app.exec_())

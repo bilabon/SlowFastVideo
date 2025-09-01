@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>SlowFastVideo.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>SlowFastVideo</string>
+	<string>com.example.slowfastvideo</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
